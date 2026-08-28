@@ -158,6 +158,16 @@ export class MetadataRegistry {
   private allMetadata: Record<string, PathMetadataEntry>
   private runtimeClones: Record<string, PathMetadataEntry>
   private regexEntries: RegexEntry[]
+  // Memoizes getMetadata() results by exact input path. getMetadata()
+  // is called on every WS broadcast meta-send and every staleness check
+  // (see src/interfaces/ws.ts and src/staleness.ts), so without this it
+  // re-runs the linear regexEntries scan on every call for every
+  // connected client - the single largest CPU cost we measured on
+  // resource-constrained hardware with many paths and clients.
+  // Cleared whenever regexEntries changes (see internalGetMetadata and
+  // addMetaData below) so a runtime PUT-based metadata override or a
+  // newly-cloned per-path entry is never served stale.
+  private lookupCache: Map<string, PathMetadataEntry | undefined>
   private readonly seedEntries: Record<string, PathMetadataEntry>
 
   constructor(entries: Record<string, PathMetadataEntry>) {
@@ -165,6 +175,7 @@ export class MetadataRegistry {
     this.allMetadata = { ...entries }
     this.runtimeClones = {}
     this.regexEntries = buildRegexArray(this.allMetadata)
+    this.lookupCache = new Map()
   }
 
   /**
@@ -176,6 +187,7 @@ export class MetadataRegistry {
     this.allMetadata = { ...this.seedEntries }
     this.runtimeClones = {}
     this.regexEntries = buildRegexArray(this.allMetadata)
+    this.lookupCache = new Map()
   }
 
   /**
@@ -183,15 +195,19 @@ export class MetadataRegistry {
    * Returns the metadata entry or undefined if no match.
    */
   getMetadata(path: string): PathMetadataEntry | undefined {
+    if (this.lookupCache.has(path)) {
+      return this.lookupCache.get(path)
+    }
     // Context-independent lookup first (strip context root + identity).
     // Fall back to the literal path so non-context root entries — /self,
     // /version — still resolve when looked up bare; those keys are not
     // '/<root>/*/<tail>'-shaped, so they never participate in the
     // path-only matcher.
-    return (
+    const result =
       this.getMetadataForLookupPath(toLookupPath(path)) ??
       this.getMetadataForLookupPath('/' + path.replace(/\./g, '/'))
-    )
+    this.lookupCache.set(path, result)
+    return result
   }
 
   // Match an already-normalized '/*/<tail>' lookup path against the regex
@@ -254,6 +270,10 @@ export class MetadataRegistry {
       key,
       metadata: cloned
     })
+    // A path that previously had no per-path clone (and so may have been
+    // cached by getMetadata() as undefined, or as the generic spec
+    // wildcard's metadata) now resolves to this new front-of-array entry.
+    this.lookupCache.clear()
     return cloned
   }
 
@@ -305,6 +325,13 @@ export class MetadataRegistry {
       key,
       metadata: entry
     })
+    // Same reasoning as internalGetMetadata: a brand-new per-path entry
+    // now sits in front of the array, so any previously cached miss (or
+    // generic-wildcard hit) for a matching path must not be served stale.
+    // (No clear() is needed on the Object.assign(existing, ...) branch
+    // above: that mutates the already-cached object in place, so any
+    // lookupCache entry referencing it observes the update automatically.)
+    this.lookupCache.clear()
   }
 
   /** Return all registered metadata entries (for the /paths endpoint). */
